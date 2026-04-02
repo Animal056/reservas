@@ -434,18 +434,58 @@ def check_availability(
 
 def _accept_all_consent_boxes(driver) -> int:
     """
-    Marca todas las casillas de verificación visibles y sin marcar.
-    En el formulario de CoverManager son siempre checkboxes de consentimiento
-    (GDPR, política de privacidad, etc.) — es seguro marcarlos todos.
-    Devuelve el nº de casillas marcadas.
+    Marca SOLO las casillas de consentimiento obligatorio (GDPR / política de privacidad).
+    Ignora casillas de newsletter, marketing, alergias u opcionales.
     """
+    # Palabras que identifican consentimiento OBLIGATORIO
+    required_kw = [
+        "tratamiento", "datos personales", "política de privacidad",
+        "privacidad", "acepto", "autorizo", "consiento", "consentimiento",
+        "lopd", "rgpd", "gdpr", "política", "legal", "términos", "terminos",
+        "condiciones", "aviso legal",
+    ]
+    # Palabras que identifican checkboxes OPCIONALES (no marcar)
+    optional_kw = [
+        "newsletter", "comunicaciones comerciales", "publicidad", "marketing",
+        "noticias", "novedades", "ofertas", "promocion", "suscrib",
+        "alerg", "preferencia",
+    ]
+
     count = 0
     for cb in driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
         try:
-            if cb.is_displayed() and not cb.is_selected():
-                driver.execute_script("arguments[0].click();", cb)
-                count += 1
-                time.sleep(0.3)
+            if not cb.is_displayed() or cb.is_selected():
+                continue
+
+            # Obtener texto del label asociado
+            label_text = ""
+            cb_id = cb.get_attribute("id") or ""
+            if cb_id:
+                try:
+                    lbl = driver.find_element(By.CSS_SELECTOR, f"label[for='{cb_id}']")
+                    label_text = lbl.text.lower()
+                except Exception:
+                    pass
+            if not label_text:
+                # Buscar en el elemento padre
+                try:
+                    label_text = driver.execute_script(
+                        "return arguments[0].closest('label,div,p,span')?.innerText || '';", cb
+                    ).lower()
+                except Exception:
+                    pass
+
+            # Si claramente es opcional → saltar
+            if any(kw in label_text for kw in optional_kw):
+                print(f"  [CM] Casilla opcional ignorada: {label_text[:60].strip()}")
+                continue
+
+            # Si es de consentimiento requerido, o no tenemos info del label → marcar
+            driver.execute_script("arguments[0].click();", cb)
+            print(f"  [CM] Casilla marcada: {label_text[:60].strip() or '(sin label)'}")
+            count += 1
+            time.sleep(0.3)
+
         except Exception:
             pass
     return count
@@ -593,15 +633,32 @@ def auto_book(
             print("  [CM] No se encontró el botón Reservar")
             return False
 
-        # ── 6. Datos personales ───────────────────────────────────────────────
+        # ── 6. Esperar a que el formulario de datos aparezca ─────────────────
+        # Después de hacer clic en Reservar la página hace transición a step 2
+        _wait_id(driver, "user_first_name", timeout=6)
+        time.sleep(0.5)  # margen extra para que el JS termine de renderizar
+
+        # ── 6b. Datos personales ─────────────────────────────────────────────
         parts = guest_name.strip().split(" ", 1)
         first_name = parts[0]
         last_name  = parts[1] if len(parts) > 1 else ""
 
         _fill_by_id(driver, "user_first_name", first_name)
         _fill_by_id(driver, "user_last_name",  last_name)
-        _fill_by_id(driver, "user_email",      guest_email)
+        _fill_by_id(driver, "user_email",      guest_email)   # alias: name="email"
         _fill_by_id(driver, "prescriber_phone", guest_phone)
+
+        # Verificar que los campos tienen valor
+        for fid, val in [("user_first_name", first_name), ("user_last_name", last_name),
+                         ("user_email", guest_email), ("prescriber_phone", guest_phone)]:
+            try:
+                elem = driver.find_element(By.ID, fid)
+                actual = elem.get_attribute("value") or ""
+                if not actual:
+                    print(f"  [CM] Advertencia: campo {fid} sigue vacío, reintentando")
+                    _fill_by_id(driver, fid, val)
+            except Exception:
+                pass
 
         if guest_notes:
             for field_id in ["comments", "note", "observations", "notas", "comment"]:
@@ -671,18 +728,51 @@ def auto_book(
                 pass
 
 def _fill_by_id(driver, field_id: str, value: str, required: bool = True):
-    """Rellena un input por su ID."""
-    try:
-        inp = driver.find_element(By.ID, field_id)
-        if inp.is_displayed():
-            inp.clear()
-            inp.send_keys(value)
-            return True
-    except Exception:
-        pass
+    """
+    Rellena un input por su ID (o name como fallback).
+    Usa JavaScript para disparar los eventos que CoverManager necesita,
+    y no depende de is_displayed() para no fallar silenciosamente.
+    """
+    # Intentar por ID, luego por name (el campo email tiene name="email", no name="user_email")
+    selectors = [(By.ID, field_id), (By.NAME, field_id)]
+    # Alias especiales conocidos de CoverManager
+    if field_id == "user_email":
+        selectors.append((By.NAME, "email"))
+
+    for by_type, selector in selectors:
+        try:
+            inp = driver.find_element(by_type, selector)
+            # Scroll al elemento para asegurar que está en el viewport
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
+            time.sleep(0.2)
+            # Limpiar con JS + send_keys + disparar todos los eventos
+            driver.execute_script(
+                "var el = arguments[0], val = arguments[1];"
+                "el.focus();"
+                "el.value = '';"
+                "el.dispatchEvent(new Event('input', {bubbles:true}));"
+                "el.value = val;"
+                "el.dispatchEvent(new Event('input', {bubbles:true}));"
+                "el.dispatchEvent(new Event('change', {bubbles:true}));"
+                "el.dispatchEvent(new Event('blur',   {bubbles:true}));",
+                inp, value
+            )
+            # También send_keys por si hay validación nativa de HTML5
+            try:
+                inp.clear()
+                inp.send_keys(value)
+            except Exception:
+                pass
+            # Verificar que el valor quedó registrado
+            actual = inp.get_attribute("value") or ""
+            if actual:
+                return True
+        except Exception:
+            pass
+
     if not required:
         return False
-    # Fallback por name
+    # Fallback por name (alias original)
     try:
         inp = driver.find_element(By.NAME, field_id)
         if inp.is_displayed():
