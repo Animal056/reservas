@@ -1,3 +1,22 @@
 {
-  "restaurants": []
+  "restaurants": [
+    {
+      "id": "cacota",
+      "name": "cacota",
+      "url": "https://www.covermanager.com/reservation/module_restaurant/restaurante-cokima/spanish",
+      "party_size": 2,
+      "time_from": "20:45",
+      "time_to": "22:30",
+      "date_from": "2026-04-03",
+      "date_to": "2026-05-02",
+      "active": true,
+      "auto_book": true,
+      "guest": {
+        "name": "Javier Algora",
+        "email": "jalgora02@gmail.com",
+        "phone": "628691667",
+        "notes": ""
+      }
+    }
+  ]
 }
