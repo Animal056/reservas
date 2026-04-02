@@ -432,6 +432,25 @@ def check_availability(
     return slots
 
 
+def _accept_all_consent_boxes(driver) -> int:
+    """
+    Marca todas las casillas de verificación visibles y sin marcar.
+    En el formulario de CoverManager son siempre checkboxes de consentimiento
+    (GDPR, política de privacidad, etc.) — es seguro marcarlos todos.
+    Devuelve el nº de casillas marcadas.
+    """
+    count = 0
+    for cb in driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"):
+        try:
+            if cb.is_displayed() and not cb.is_selected():
+                driver.execute_script("arguments[0].click();", cb)
+                count += 1
+                time.sleep(0.3)
+        except Exception:
+            pass
+    return count
+
+
 def _click_reservar(driver) -> bool:
     """Hace clic en el botón Reservar (paso 1). Devuelve True si lo encontró."""
     for css in [
@@ -590,28 +609,55 @@ def auto_book(
 
         time.sleep(0.5)
 
-        # ── 7. Confirmar (paso final)
+        # ── 6b. Checkboxes de consentimiento (GDPR / política de privacidad) ─
+        #   CoverManager requiere marcar "Consiento el tratamiento de datos..."
+        #   Marcamos todos los checkboxes visibles sin marcar del formulario.
+        n_checked = _accept_all_consent_boxes(driver)
+        if n_checked:
+            print(f"  [CM] {n_checked} casilla(s) de consentimiento marcadas")
+        time.sleep(0.3)
+
+        # ── 7. Confirmar (con gestión de alerts de consentimiento pendientes) ─
         confirmed = False
-        for css in [
-            "button.reservarButton.step2",
-            "button[class*='reservarButton']",
-            "input[class*='reservarButton'][class*='step2']",
-        ]:
+
+        def _try_confirm():
+            for css in [
+                "button.reservarButton.step2",
+                "button[class*='reservarButton']",
+                "input[class*='reservarButton'][class*='step2']",
+            ]:
+                try:
+                    btn = driver.find_element(By.CSS_SELECTOR, css)
+                    if btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", btn)
+                        time.sleep(3)
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        try:
+            confirmed = _try_confirm()
+        except UnexpectedAlertPresentException:
+            _dismiss_alert(driver)
+
+        # Si hay alert de consentimiento, marcar checkboxes y reintentar
+        alert_confirm = _dismiss_alert(driver)
+        if alert_confirm:
+            print(f"  [CM] Alert en confirmación: '{alert_confirm}' — marcando casillas y reintentando")
+            _accept_all_consent_boxes(driver)
+            time.sleep(0.5)
             try:
-                btn = driver.find_element(By.CSS_SELECTOR, css)
-                if btn.is_displayed():
-                    driver.execute_script("arguments[0].click();", btn)
-                    confirmed = True
-                    time.sleep(3)
-                    break
-            except Exception:
-                pass
+                confirmed = _try_confirm()
+            except UnexpectedAlertPresentException:
+                _dismiss_alert(driver)
 
         page_lower = driver.page_source.lower()
         success = confirmed and any(kw in page_lower for kw in [
             "confirmad", "confirmed", "gracias", "thank", "reserva realizada",
-            "booking confirmed", "éxito",
+            "booking confirmed", "éxito", "ha sido reservada",
         ])
+        print(f"  [CM] auto_book {'✅ OK' if success else '❌ no confirmado'}")
         return success
 
     except Exception as e:
