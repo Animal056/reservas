@@ -167,33 +167,92 @@ def _set_date(driver, date_str: str) -> bool:
 
 # ── Zona ──────────────────────────────────────────────────────────────────────
 
-def _set_zone(driver, preferred_zone: str):
-    if not preferred_zone:
-        return
-    zone_lower = preferred_zone.lower()
+# Palabras clave cómodas (de mejor a peor)
+_COMFORT_ZONES   = ["sala", "salón", "salon", "interior", "comedor", "dining", "mesa", "restaurante", "room"]
+# Zonas a evitar si hay alternativa
+_AVOID_ZONES     = ["barra", "bar ", "standing", "de pie", "terraza", "exterior"]
 
-    # Selector real de zona en CoverManager
-    for elem_id in ["extra-box-select"]:
-        try:
-            elem = driver.find_element(By.ID, elem_id)
-            for opt in elem.find_elements(By.TAG_NAME, "option"):
-                if zone_lower in opt.text.lower():
-                    Select(elem).select_by_visible_text(opt.text)
+
+def _select_zone_from_elem(zone_elem, preferred_zone: str) -> bool:
+    """
+    Elige la mejor zona disponible en un <select> dado.
+    Prioridad: preferida → sala/interior → cualquier opción no-barra → primera disponible
+    Devuelve True si se seleccionó algo.
+    """
+    try:
+        options = zone_elem.find_elements(By.TAG_NAME, "option")
+        # Filtrar opciones reales (excluir "Seleccione la zona" y vacías)
+        real_opts = [
+            o for o in options
+            if (o.get_attribute("value") or "").strip() not in ("-1", "", "0")
+            and o.text.strip()
+        ]
+        if not real_opts:
+            return True  # No hay zonas configuradas → no bloquea
+
+        # 1. Zona preferida por el usuario
+        if preferred_zone:
+            for opt in real_opts:
+                if preferred_zone.lower() in opt.text.lower():
+                    Select(zone_elem).select_by_visible_text(opt.text)
                     time.sleep(0.5)
-                    return
-        except Exception:
-            pass
+                    print(f"  [CM] Zona seleccionada (preferida): {opt.text}")
+                    return True
 
-    # Fallback genérico
+        # 2. Lista de comodidad: sala → interior → comedor → ...
+        for kw in _COMFORT_ZONES:
+            for opt in real_opts:
+                if kw in opt.text.lower():
+                    Select(zone_elem).select_by_visible_text(opt.text)
+                    time.sleep(0.5)
+                    print(f"  [CM] Zona seleccionada (cómoda): {opt.text}")
+                    return True
+
+        # 3. Cualquier opción que no sea barra/exterior
+        for opt in real_opts:
+            if not any(av in opt.text.lower() for av in _AVOID_ZONES):
+                Select(zone_elem).select_by_visible_text(opt.text)
+                time.sleep(0.5)
+                print(f"  [CM] Zona seleccionada (disponible): {opt.text}")
+                return True
+
+        # 4. Última opción: lo que sea (barra incluida) — reservar es lo primero
+        Select(zone_elem).select_by_visible_text(real_opts[0].text)
+        time.sleep(0.5)
+        print(f"  [CM] Zona seleccionada (único disponible): {real_opts[0].text}")
+        return True
+
+    except Exception as e:
+        print(f"  [CM] Error seleccionando zona: {e}")
+        return False
+
+
+def _set_zone(driver, preferred_zone: str = "") -> bool:
+    """
+    Selecciona la zona más cómoda disponible.
+    Siempre intenta seleccionar algo aunque preferred_zone esté vacío,
+    porque CoverManager puede requerir zona obligatoria.
+    """
+    # Selector real de CoverManager
+    try:
+        elem = driver.find_element(By.ID, "extra-box-select")
+        if elem.is_displayed():
+            return _select_zone_from_elem(elem, preferred_zone)
+    except Exception:
+        pass
+
+    # Fallback: cualquier select visible con opciones de zona
     for sel in driver.find_elements(By.TAG_NAME, "select"):
         try:
-            for opt in sel.find_elements(By.TAG_NAME, "option"):
-                if zone_lower in opt.text.lower():
-                    Select(sel).select_by_visible_text(opt.text)
-                    time.sleep(0.5)
-                    return
+            if not sel.is_displayed():
+                continue
+            opts_text = [o.text.lower() for o in sel.find_elements(By.TAG_NAME, "option")]
+            if any(kw in " ".join(opts_text) for kw in ["sala", "barra", "terraza", "zona"]):
+                return _select_zone_from_elem(sel, preferred_zone)
         except Exception:
             pass
+
+    return True  # No se encontró selector de zona → no es necesario
 
 
 # ── Extraer huecos ────────────────────────────────────────────────────────────
@@ -373,6 +432,47 @@ def check_availability(
     return slots
 
 
+def _click_reservar(driver) -> bool:
+    """Hace clic en el botón Reservar (paso 1). Devuelve True si lo encontró."""
+    for css in [
+        "input.reservarButton.step1",
+        "input[class*='reservarButton'][value*='eservar']",
+        "input[class*='reservarButton']",
+        "button[class*='reservarButton']",
+    ]:
+        try:
+            btn = driver.find_element(By.CSS_SELECTOR, css)
+            if btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+    # Fallback por texto
+    for btn in driver.find_elements(By.CSS_SELECTOR, "input[type='button'],input[type='submit'],button"):
+        try:
+            val = (btn.get_attribute("value") or btn.text or "").lower()
+            if "reservar" in val and btn.is_displayed():
+                driver.execute_script("arguments[0].click();", btn)
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def _dismiss_alert(driver) -> str:
+    """Si hay un alert de JavaScript, lo cierra y devuelve su texto. '' si no hay."""
+    try:
+        alert = driver.switch_to.alert
+        txt = alert.text or ""
+        alert.accept()
+        time.sleep(0.8)
+        return txt
+    except Exception:
+        return ""
+
+
 def auto_book(
     restaurant_url: str,
     date: str,
@@ -384,25 +484,40 @@ def auto_book(
     guest_notes: str = "",
     preferred_zone: str = "",
 ) -> bool:
-    """Realiza la reserva automáticamente gestionando la zona y alertas emergentes."""
-    from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException
+    """
+    Realiza la reserva automáticamente.
+
+    Orden correcto:
+      1. Personas
+      2. Fecha (click en calendario)
+      3. Zona — SIEMPRE después de la fecha porque el clic en el calendar
+         puede resetear la zona. Se intenta: preferida → sala/salón → cualquiera.
+      4. Hora
+      5. Reservar (si hay alert de zona, selecciona zona y reintenta)
+      6. Datos personales
+      7. Confirmar
+    """
+    from selenium.common.exceptions import UnexpectedAlertPresentException
     driver = None
     try:
         driver = _get_driver()
         driver.get(restaurant_url)
         time.sleep(5)
 
-        # 1. Personas
+        # ── 1. Personas ──────────────────────────────────────────────────────
         _set_people(driver, party_size)
 
-        # 2. Zona (Obligatorio en Cokima y otros antes de confirmar hora)
-        if preferred_zone:
-            _set_zone(driver, preferred_zone)
+        # ── 2. Fecha ─────────────────────────────────────────────────────────
+        date_ok = _set_date(driver, date)
+        if not date_ok:
+            print(f"  [CM] Advertencia: no se pudo seleccionar la fecha {date}")
 
-        # 3. Fecha
-        _set_date(driver, date)
+        # ── 3. Zona — DESPUÉS de la fecha (el calendario puede resetearla) ──
+        #    Siempre intentamos, aunque preferred_zone esté vacío,
+        #    porque en muchos restaurantes la zona es obligatoria.
+        _set_zone(driver, preferred_zone)
 
-        # 4. Seleccionar la hora en hour-box-select
+        # ── 4. Hora ──────────────────────────────────────────────────────────
         hour_selected = False
         try:
             elem = driver.find_element(By.ID, "hour-box-select")
@@ -431,47 +546,35 @@ def auto_book(
             print(f"  [CM] No se pudo seleccionar el hueco {slot_time}")
             return False
 
-        # 5. Clic en "Reservar" gestionando posibles alertas emergentes (JavaScript alerts)
-        clicked_reserve = False
+        # ── 5. Reservar ───────────────────────────────────────────────────────
+        # Intento 1
+        clicked = False
         try:
-            for css in [
-                "input.reservarButton.step1",
-                "input[class*='reservarButton'][value*='eservar']",
-                "input[class*='reservarButton']",
-                "button[class*='reservarButton']",
-            ]:
-                try:
-                    btn = driver.find_element(By.CSS_SELECTOR, css)
-                    if btn.is_displayed():
-                        driver.execute_script("arguments[0].click();", btn)
-                        clicked_reserve = True
-                        time.sleep(2)
-                        break
-                except Exception:
-                    pass
-                    
-            # Revisar si ha saltado alguna alerta tras hacer clic
-            try:
-                alert = driver.switch_to.alert
-                print(f"  [CM] Alerta interceptada y descartada: {alert.text}")
-                alert.accept()
-                time.sleep(1)
-            except NoAlertPresentException:
-                pass
+            clicked = _click_reservar(driver)
+        except UnexpectedAlertPresentException:
+            _dismiss_alert(driver)
 
-        except UnexpectedAlertPresentException as e:
-            print(f"  [CM] Alerta inesperada bloqueó el proceso: {e.alert_text}")
+        # Si hay alert de zona, seleccionar zona y reintentar
+        alert_txt = _dismiss_alert(driver)
+        if alert_txt:
+            print(f"  [CM] Alert tras Reservar: '{alert_txt}' — seleccionando zona y reintentando")
+            _set_zone(driver, preferred_zone)
+            time.sleep(0.5)
             try:
-                driver.switch_to.alert.accept()
-            except Exception:
-                pass
-            return False
+                clicked = _click_reservar(driver)
+            except UnexpectedAlertPresentException:
+                _dismiss_alert(driver)
+            # Un segundo alert indicaría otro problema
+            alert_txt2 = _dismiss_alert(driver)
+            if alert_txt2:
+                print(f"  [CM] Segundo alert: '{alert_txt2}' — abortando")
+                return False
 
-        if not clicked_reserve:
+        if not clicked:
             print("  [CM] No se encontró el botón Reservar")
             return False
 
-        # 6. Rellenar datos personales
+        # ── 6. Datos personales ───────────────────────────────────────────────
         parts = guest_name.strip().split(" ", 1)
         first_name = parts[0]
         last_name  = parts[1] if len(parts) > 1 else ""
@@ -487,7 +590,7 @@ def auto_book(
 
         time.sleep(0.5)
 
-        # 7. Confirmar (paso final)
+        # ── 7. Confirmar (paso final)
         confirmed = False
         for css in [
             "button.reservarButton.step2",
