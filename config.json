@@ -1,16 +1,3 @@
 {
-  "restaurants": [
-    {
-      "id": "cokima",
-      "name": "cokima",
-      "url": "https://www.covermanager.com/reservation/module_restaurant/restaurante-cokima/spanish",
-      "party_size": 2,
-      "time_from": "14:00",
-      "time_to": "15:00",
-      "date_from": "2026-04-03",
-      "date_to": "2026-05-02",
-      "active": true,
-      "auto_book": false
-    }
-  ]
+  "restaurants": []
 }

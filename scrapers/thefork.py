@@ -1,24 +1,33 @@
 """
-Scraper de TheFork (thefork.es) para buscar restaurantes alternativos en Madrid.
-Usa Playwright porque TheFork es una SPA en React.
+Scraper de TheFork para buscar restaurantes alternativos en Madrid.
+Usa requests + BeautifulSoup con headers de navegador real.
 """
 
+import json
 import re
-from playwright.sync_api import sync_playwright
+import requests
+from bs4 import BeautifulSoup
 
-MADRID_SEARCH_URL = (
-    "https://www.thefork.es/restaurantes/madrid-c614891"
-    "?sortBy=RATE_GEO&sortOrder=desc&cityName=Madrid"
-)
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "es-ES,es;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.thefork.es/",
+}
 
+# Palabras clave por zona para filtrar resultados
 ZONE_KEYWORDS = {
-    "Centro": ["centro", "sol", "gran vía", "opera", "mayor"],
-    "Salamanca": ["salamanca", "serrano", "goya", "velázquez", "castellana"],
-    "Malasaña / Chueca": ["malasaña", "chueca", "fuencarral", "tribunal"],
-    "Chamberí": ["chamberí", "alonso cano", "iglesia", "bilbao"],
+    "Centro": ["centro", "sol", "gran via", "opera", "mayor", "chueca"],
+    "Salamanca": ["salamanca", "serrano", "goya", "velazquez", "castellana"],
+    "Malasaña / Chueca": ["malasana", "chueca", "fuencarral", "tribunal"],
+    "Chamberí": ["chamberi", "alonso cano", "iglesia", "bilbao"],
     "Retiro": ["retiro", "ibiza", "lista", "principe de vergara"],
-    "Chamartín": ["chamartín", "tetuán", "concha espina"],
-    "Lavapiés": ["lavapiés", "embajadores", "tirso de molina"],
+    "Chamartín": ["chamartin", "tetuan", "concha espina"],
+    "Lavapiés": ["lavapies", "embajadores", "tirso de molina"],
     "La Latina": ["la latina", "cava baja", "rastro"],
 }
 
@@ -30,168 +39,214 @@ def search_restaurants(
     limit: int = 10,
 ) -> list[dict]:
     """
-    Busca restaurantes en TheFork Madrid con los criterios dados.
-
-    Args:
-        cuisine: Tipo de cocina (ej. "Japonesa"). None = cualquiera.
-        min_rating: Valoración mínima (sobre 10).
-        zone: Zona de Madrid. None = toda Madrid.
-        limit: Máximo de resultados.
-
-    Returns:
-        Lista de restaurantes: [{'name', 'rating', 'cuisine', 'price', 'url', 'address'}, ...]
+    Busca restaurantes en TheFork Madrid.
+    Devuelve lista de dicts con name, rating, cuisine, price, url, address.
     """
-    results = []
+    results = _search_via_requests(cuisine, min_rating, zone, limit)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+    if not results:
+        results = _search_via_api(cuisine, min_rating, zone, limit)
+
+    return results[:limit]
+
+
+def _search_via_requests(cuisine, min_rating, zone, limit) -> list:
+    """Intenta obtener resultados scrapeando la web de TheFork."""
+    try:
+        url = "https://www.thefork.es/restaurantes/madrid-c614891?sortBy=RATE_GEO&sortOrder=desc"
+        resp = requests.get(url, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+        results = []
+
+        # TheFork incluye datos en JSON-LD
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    if item.get("@type") not in ("Restaurant", "FoodEstablishment"):
+                        continue
+                    r = _parse_jsonld(item, cuisine, min_rating, zone)
+                    if r:
+                        results.append(r)
+                        if len(results) >= limit:
+                            return results
+            except Exception:
+                pass
+
+        # Fallback: buscar en el JSON incrustado en la página (Next.js / __NEXT_DATA__)
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data:
+            try:
+                payload = json.loads(next_data.string or "")
+                restaurants_raw = _dig(payload, "restaurants") or _dig(payload, "items") or []
+                for item in restaurants_raw:
+                    r = _parse_generic(item, cuisine, min_rating, zone)
+                    if r:
+                        results.append(r)
+                        if len(results) >= limit:
+                            return results
+            except Exception:
+                pass
+
+        return results
+
+    except Exception as e:
+        print(f"TheFork requests error: {e}")
+        return []
+
+
+def _search_via_api(cuisine, min_rating, zone, limit) -> list:
+    """Intenta llamar a la API interna de TheFork."""
+    try:
+        # TheFork tiene una API GraphQL o REST interna
+        api_url = "https://www.thefork.es/api/restaurant/search"
+        params = {
+            "cityId": 614891,
+            "cityName": "Madrid",
+            "sortBy": "RATE_GEO",
+            "limit": limit * 2,
+        }
+        resp = requests.get(api_url, headers=HEADERS, params=params, timeout=15)
+        if resp.status_code != 200:
+            return []
+
+        data = resp.json()
+        raw_list = (
+            data.get("items")
+            or data.get("restaurants")
+            or data.get("data", {}).get("restaurants")
+            or []
         )
-        context = browser.new_context(
-            locale="es-ES",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            ),
+        results = []
+        for item in raw_list:
+            r = _parse_generic(item, cuisine, min_rating, zone)
+            if r:
+                results.append(r)
+        return results
+
+    except Exception as e:
+        print(f"TheFork API error: {e}")
+        return []
+
+
+# ── Parsers ────────────────────────────────────────────────────────────────────
+
+def _parse_jsonld(item: dict, cuisine, min_rating, zone) -> dict | None:
+    try:
+        rating = float(
+            item.get("aggregateRating", {}).get("ratingValue", 0) or 0
         )
-        page = context.new_page()
+        if rating < min_rating:
+            return None
 
-        try:
-            page.goto(MADRID_SEARCH_URL, wait_until="networkidle", timeout=40000)
-            page.wait_for_timeout(3000)
+        name = item.get("name", "")
+        url = item.get("url", "")
+        cuisine_text = ", ".join(item.get("servesCuisine", [])) if isinstance(
+            item.get("servesCuisine"), list
+        ) else str(item.get("servesCuisine", ""))
+        price = item.get("priceRange", "")
+        address = (
+            item.get("address", {}).get("streetAddress", "")
+            if isinstance(item.get("address"), dict)
+            else ""
+        )
 
-            # Intentar hacer scroll para cargar más resultados
-            for _ in range(3):
-                page.evaluate("window.scrollBy(0, 800)")
-                page.wait_for_timeout(1000)
+        if not _passes_filters(name, cuisine_text, address, cuisine, zone):
+            return None
 
-            # Selectores comunes de tarjetas de restaurante en TheFork
-            card_selectors = [
-                "article",
-                "[data-test*='restaurant']",
-                "[class*='restaurantCard']",
-                "[class*='restaurant-card']",
-                "[class*='RestaurantCard']",
-            ]
+        return {
+            "name": name,
+            "rating": rating,
+            "cuisine": cuisine_text,
+            "price": price,
+            "url": url,
+            "address": address,
+        }
+    except Exception:
+        return None
 
-            cards = []
-            for sel in card_selectors:
-                found = page.locator(sel).all()
-                if found:
-                    cards = found
-                    break
 
-            rating_re = re.compile(r"(\d+[,\.]\d+)")
-
-            for card in cards[: limit * 4]:
+def _parse_generic(item: dict, cuisine, min_rating, zone) -> dict | None:
+    """Parsea un dict genérico de la API interna de TheFork."""
+    try:
+        # Intentar extraer rating de varios campos posibles
+        rating = 0.0
+        for key in ["ratingValue", "rating", "score", "aggregateRating"]:
+            val = item.get(key)
+            if isinstance(val, dict):
+                val = val.get("ratingValue") or val.get("value")
+            if val:
                 try:
-                    # Nombre
-                    name = ""
-                    for name_sel in ["h2", "h3", "[class*='name']", "[class*='Name']"]:
-                        try:
-                            name = card.locator(name_sel).first.inner_text(timeout=400).strip()
-                            if name:
-                                break
-                        except Exception:
-                            pass
-
-                    if not name:
-                        continue
-
-                    # Valoración
-                    rating = 0.0
-                    for rating_sel in [
-                        "[class*='rating']",
-                        "[class*='Rating']",
-                        "[class*='score']",
-                        "[class*='note']",
-                    ]:
-                        try:
-                            rating_text = card.locator(rating_sel).first.inner_text(timeout=400)
-                            m = rating_re.search(rating_text)
-                            if m:
-                                rating = float(m.group(1).replace(",", "."))
-                                break
-                        except Exception:
-                            pass
-
-                    if rating < min_rating:
-                        continue
-
-                    # URL
-                    url = ""
-                    try:
-                        href = card.locator("a").first.get_attribute("href", timeout=400)
-                        if href:
-                            url = href if href.startswith("http") else "https://www.thefork.es" + href
-                    except Exception:
-                        pass
-
-                    # Cocina
-                    cuisine_text = ""
-                    for c_sel in ["[class*='cuisine']", "[class*='Cuisine']", "[class*='tipo']", "[class*='tag']"]:
-                        try:
-                            cuisine_text = card.locator(c_sel).first.inner_text(timeout=400).strip()
-                            if cuisine_text:
-                                break
-                        except Exception:
-                            pass
-
-                    # Precio
-                    price_text = ""
-                    for p_sel in ["[class*='price']", "[class*='Price']", "[class*='precio']"]:
-                        try:
-                            price_text = card.locator(p_sel).first.inner_text(timeout=400).strip()
-                            if price_text:
-                                break
-                        except Exception:
-                            pass
-
-                    # Dirección
-                    address_text = ""
-                    for a_sel in ["[class*='address']", "[class*='Address']", "[class*='location']"]:
-                        try:
-                            address_text = card.locator(a_sel).first.inner_text(timeout=400).strip()
-                            if address_text:
-                                break
-                        except Exception:
-                            pass
-
-                    # Filtrar por cocina
-                    if cuisine:
-                        combined = (name + " " + cuisine_text).lower()
-                        if cuisine.lower() not in combined:
-                            continue
-
-                    # Filtrar por zona
-                    if zone and zone in ZONE_KEYWORDS:
-                        zone_kw = ZONE_KEYWORDS[zone]
-                        combined = (name + " " + address_text + " " + cuisine_text).lower()
-                        if not any(kw in combined for kw in zone_kw):
-                            continue
-
-                    results.append(
-                        {
-                            "name": name,
-                            "rating": rating,
-                            "cuisine": cuisine_text,
-                            "price": price_text,
-                            "url": url,
-                            "address": address_text,
-                        }
-                    )
-
-                    if len(results) >= limit:
-                        break
-
+                    rating = float(str(val).replace(",", "."))
+                    break
                 except Exception:
                     pass
 
-        except Exception as e:
-            print(f"Error buscando en TheFork: {e}")
-        finally:
-            browser.close()
+        if rating < min_rating:
+            return None
 
-    return results
+        name = item.get("name") or item.get("restaurantName") or ""
+        if not name:
+            return None
+
+        url = item.get("url") or item.get("restaurantUrl") or ""
+        if url and not url.startswith("http"):
+            url = "https://www.thefork.es" + url
+
+        cuisine_text = item.get("cuisine") or item.get("cuisineType") or ""
+        if isinstance(cuisine_text, list):
+            cuisine_text = ", ".join(cuisine_text)
+
+        price = item.get("priceRange") or item.get("price") or ""
+        address = item.get("address") or item.get("streetAddress") or ""
+        if isinstance(address, dict):
+            address = address.get("streetAddress") or address.get("street") or ""
+
+        if not _passes_filters(name, cuisine_text, address, cuisine, zone):
+            return None
+
+        return {
+            "name": str(name),
+            "rating": rating,
+            "cuisine": str(cuisine_text),
+            "price": str(price),
+            "url": str(url),
+            "address": str(address),
+        }
+    except Exception:
+        return None
+
+
+def _passes_filters(name, cuisine_text, address, cuisine_filter, zone_filter) -> bool:
+    if cuisine_filter:
+        combined = (name + " " + cuisine_text).lower()
+        if cuisine_filter.lower() not in combined:
+            return False
+    if zone_filter and zone_filter in ZONE_KEYWORDS:
+        combined = (name + " " + address).lower()
+        # Normalizar tildes
+        combined = combined.replace("á", "a").replace("é", "e").replace(
+            "í", "i").replace("ó", "o").replace("ú", "u").replace("ñ", "n")
+        if not any(kw in combined for kw in ZONE_KEYWORDS[zone_filter]):
+            return False
+    return True
+
+
+def _dig(obj, key: str):
+    """Busca recursivamente una clave en un dict/lista anidados."""
+    if isinstance(obj, dict):
+        if key in obj:
+            return obj[key]
+        for v in obj.values():
+            result = _dig(v, key)
+            if result is not None:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _dig(item, key)
+            if result is not None:
+                return result
+    return None

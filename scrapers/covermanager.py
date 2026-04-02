@@ -382,21 +382,27 @@ def auto_book(
     guest_email: str,
     guest_phone: str,
     guest_notes: str = "",
+    preferred_zone: str = "",
 ) -> bool:
-    """Realiza la reserva automáticamente."""
+    """Realiza la reserva automáticamente gestionando la zona y alertas emergentes."""
+    from selenium.common.exceptions import UnexpectedAlertPresentException, NoAlertPresentException
     driver = None
     try:
         driver = _get_driver()
         driver.get(restaurant_url)
         time.sleep(5)
 
-        # Personas
+        # 1. Personas
         _set_people(driver, party_size)
 
-        # Fecha
+        # 2. Zona (Obligatorio en Cokima y otros antes de confirmar hora)
+        if preferred_zone:
+            _set_zone(driver, preferred_zone)
+
+        # 3. Fecha
         _set_date(driver, date)
 
-        # Seleccionar la hora en hour-box-select
+        # 4. Seleccionar la hora en hour-box-select
         hour_selected = False
         try:
             elem = driver.find_element(By.ID, "hour-box-select")
@@ -407,7 +413,6 @@ def auto_book(
             pass
 
         if not hour_selected:
-            # Fallback: buscar botón/elemento con esa hora
             time_re = re.compile(r"\b" + re.escape(slot_time) + r"\b")
             for css in ["button", "[class*='slot']", "[data-time]", "a", "li"]:
                 for elem in driver.find_elements(By.CSS_SELECTOR, css)[:60]:
@@ -426,43 +431,47 @@ def auto_book(
             print(f"  [CM] No se pudo seleccionar el hueco {slot_time}")
             return False
 
-        # Clic en "Reservar" (paso 1)
+        # 5. Clic en "Reservar" gestionando posibles alertas emergentes (JavaScript alerts)
         clicked_reserve = False
-        for css in [
-            "input.reservarButton.step1",
-            "input[class*='reservarButton'][value*='eservar']",
-            "input[class*='reservarButton']",
-            "button[class*='reservarButton']",
-        ]:
-            try:
-                btn = driver.find_element(By.CSS_SELECTOR, css)
-                if btn.is_displayed():
-                    driver.execute_script("arguments[0].click();", btn)
-                    clicked_reserve = True
-                    time.sleep(2)
-                    break
-            except Exception:
-                pass
-
-        if not clicked_reserve:
-            # Buscar botón por texto
-            for btn in driver.find_elements(By.TAG_NAME, "input"):
+        try:
+            for css in [
+                "input.reservarButton.step1",
+                "input[class*='reservarButton'][value*='eservar']",
+                "input[class*='reservarButton']",
+                "button[class*='reservarButton']",
+            ]:
                 try:
-                    val = (btn.get_attribute("value") or "").lower()
-                    if "reservar" in val and btn.is_displayed():
+                    btn = driver.find_element(By.CSS_SELECTOR, css)
+                    if btn.is_displayed():
                         driver.execute_script("arguments[0].click();", btn)
                         clicked_reserve = True
                         time.sleep(2)
                         break
                 except Exception:
                     pass
+                    
+            # Revisar si ha saltado alguna alerta tras hacer clic
+            try:
+                alert = driver.switch_to.alert
+                print(f"  [CM] Alerta interceptada y descartada: {alert.text}")
+                alert.accept()
+                time.sleep(1)
+            except NoAlertPresentException:
+                pass
+
+        except UnexpectedAlertPresentException as e:
+            print(f"  [CM] Alerta inesperada bloqueó el proceso: {e.alert_text}")
+            try:
+                driver.switch_to.alert.accept()
+            except Exception:
+                pass
+            return False
 
         if not clicked_reserve:
             print("  [CM] No se encontró el botón Reservar")
             return False
 
-        # Rellenar datos personales
-        # Dividir nombre en nombre + apellido
+        # 6. Rellenar datos personales
         parts = guest_name.strip().split(" ", 1)
         first_name = parts[0]
         last_name  = parts[1] if len(parts) > 1 else ""
@@ -472,14 +481,13 @@ def auto_book(
         _fill_by_id(driver, "user_email",      guest_email)
         _fill_by_id(driver, "prescriber_phone", guest_phone)
 
-        # Notas/comentarios (si existe el campo)
         if guest_notes:
             for field_id in ["comments", "note", "observations", "notas", "comment"]:
                 _fill_by_id(driver, field_id, guest_notes, required=False)
 
         time.sleep(0.5)
 
-        # Confirmar (paso 2)
+        # 7. Confirmar (paso final)
         confirmed = False
         for css in [
             "button.reservarButton.step2",
@@ -496,21 +504,6 @@ def auto_book(
             except Exception:
                 pass
 
-        if not confirmed:
-            # Buscar por texto en todos los botones
-            for btn in driver.find_elements(By.CSS_SELECTOR, "button, input[type='button'], input[type='submit']"):
-                try:
-                    text = (btn.text + " " + (btn.get_attribute("value") or "")).lower()
-                    if any(kw in text for kw in ["confirm", "reservar", "finalizar", "enviar", "aceptar"]):
-                        if btn.is_displayed():
-                            driver.execute_script("arguments[0].click();", btn)
-                            confirmed = True
-                            time.sleep(3)
-                            break
-                except Exception:
-                    pass
-
-        # Verificar confirmación en el texto de la página
         page_lower = driver.page_source.lower()
         success = confirmed and any(kw in page_lower for kw in [
             "confirmad", "confirmed", "gracias", "thank", "reserva realizada",
@@ -519,7 +512,7 @@ def auto_book(
         return success
 
     except Exception as e:
-        print(f"  [CM] Error auto_book: {e}")
+        print(f"  [CM] Error auto_book general: {e}")
         return False
     finally:
         if driver:
@@ -527,7 +520,6 @@ def auto_book(
                 driver.quit()
             except Exception:
                 pass
-
 
 def _fill_by_id(driver, field_id: str, value: str, required: bool = True):
     """Rellena un input por su ID."""
