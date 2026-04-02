@@ -698,10 +698,18 @@ def auto_book(
         except UnexpectedAlertPresentException:
             _dismiss_alert(driver)
 
-        # Si hay alert de consentimiento, marcar checkboxes y reintentar
+        # Si hay alert, analizar qué falta y corregir antes de reintentar
         alert_confirm = _dismiss_alert(driver)
         if alert_confirm:
-            print(f"  [CM] Alert en confirmación: '{alert_confirm}' — marcando casillas y reintentando")
+            print(f"  [CM] Alert en confirmación: '{alert_confirm}' — corrigiendo y reintentando")
+            alert_lower = alert_confirm.lower()
+            # Si el alert menciona que faltan datos personales, re-rellenar el formulario
+            if any(kw in alert_lower for kw in ["nombre", "apellido", "email", "teléfono", "telefono", "rellenar", "campos"]):
+                _fill_by_id(driver, "user_first_name", first_name)
+                _fill_by_id(driver, "user_last_name",  last_name)
+                _fill_by_id(driver, "user_email",      guest_email)
+                _fill_by_id(driver, "prescriber_phone", guest_phone)
+                time.sleep(0.5)
             _accept_all_consent_boxes(driver)
             time.sleep(0.5)
             try:
@@ -709,7 +717,11 @@ def auto_book(
             except UnexpectedAlertPresentException:
                 _dismiss_alert(driver)
 
-        page_lower = driver.page_source.lower()
+        _dismiss_alert(driver)  # cierra cualquier alert residual antes de leer page_source
+        try:
+            page_lower = driver.page_source.lower()
+        except Exception:
+            page_lower = ""
         success = confirmed and any(kw in page_lower for kw in [
             "confirmad", "confirmed", "gracias", "thank", "reserva realizada",
             "booking confirmed", "éxito", "ha sido reservada",
@@ -745,28 +757,35 @@ def _fill_by_id(driver, field_id: str, value: str, required: bool = True):
             # Scroll al elemento para asegurar que está en el viewport
             driver.execute_script("arguments[0].scrollIntoView({block:'center'});", inp)
             time.sleep(0.2)
-            # Limpiar con JS + send_keys + disparar todos los eventos
+            # Usar el setter nativo de HTMLInputElement para que React/Vue detecte el cambio.
+            # El simple `el.value = val` bypasea el getter/setter que frameworks reactivos
+            # instalan sobre la propiedad, por lo que el modelo interno no se actualiza.
             driver.execute_script(
                 "var el = arguments[0], val = arguments[1];"
+                "var nativeSetter = Object.getOwnPropertyDescriptor("
+                "    window.HTMLInputElement.prototype, 'value').set;"
                 "el.focus();"
-                "el.value = '';"
+                "nativeSetter.call(el, '');"
                 "el.dispatchEvent(new Event('input', {bubbles:true}));"
-                "el.value = val;"
-                "el.dispatchEvent(new Event('input', {bubbles:true}));"
+                "nativeSetter.call(el, val);"
+                "el.dispatchEvent(new InputEvent('input', {bubbles:true, inputType:'insertText', data:val}));"
                 "el.dispatchEvent(new Event('change', {bubbles:true}));"
                 "el.dispatchEvent(new Event('blur',   {bubbles:true}));",
                 inp, value
             )
-            # También send_keys por si hay validación nativa de HTML5
-            try:
-                inp.clear()
-                inp.send_keys(value)
-            except Exception:
-                pass
             # Verificar que el valor quedó registrado
             actual = inp.get_attribute("value") or ""
             if actual:
                 return True
+            # Fallback: send_keys si el setter nativo no funcionó
+            try:
+                inp.clear()
+                inp.send_keys(value)
+                actual = inp.get_attribute("value") or ""
+                if actual:
+                    return True
+            except Exception:
+                pass
         except Exception:
             pass
 
