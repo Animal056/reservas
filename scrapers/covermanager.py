@@ -1,14 +1,325 @@
 """
-CoverManager availability scraper.
+CoverManager scraper — reescrito con los selectores reales del widget.
 
-Usa Playwright para cargar el widget de reservas, interceptar las llamadas
-a la API y extraer los huecos disponibles.
+Selectores confirmados inspeccionando el DOM en vivo:
+  Personas  → select#people-box-select
+  Fecha     → jQuery UI datepicker inline (.ui-datepicker-calendar td > a)
+  Horas     → select#hour-box-select  (opciones con value="HH:MM")
+  Zona      → select#extra-box-select (opción "Sala", "Terraza", etc.)
+  Botón ok  → input.reservarButton.step1
+  Formulario→ input#user_first_name, input#user_last_name,
+              input#user_email, input#prescriber_phone
 """
 
 import re
-import json
+import time
 from datetime import datetime
-from playwright.sync_api import sync_playwright
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+# ── Driver ────────────────────────────────────────────────────────────────────
+
+def _get_driver():
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    )
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    try:
+        from webdriver_manager.chrome import ChromeDriverManager
+        service = Service(ChromeDriverManager().install())
+    except Exception:
+        service = Service()
+    return webdriver.Chrome(service=service, options=options)
+
+
+def _wait(driver, css, timeout=8):
+    try:
+        return WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, css))
+        )
+    except Exception:
+        return None
+
+
+def _wait_id(driver, elem_id, timeout=8):
+    try:
+        return WebDriverWait(driver, timeout).until(
+            EC.presence_of_element_located((By.ID, elem_id))
+        )
+    except Exception:
+        return None
+
+
+# ── Personas ──────────────────────────────────────────────────────────────────
+
+def _set_people(driver, party_size: int) -> bool:
+    """Selecciona el número de personas. Devuelve True si tuvo éxito."""
+    # ID real del widget
+    for elem_id in ["people-box-select", "people_search"]:
+        try:
+            elem = driver.find_element(By.ID, elem_id)
+            if elem.is_displayed():
+                Select(elem).select_by_value(str(party_size))
+                time.sleep(1.5)
+                return True
+        except Exception:
+            pass
+
+    # Fallback genérico: cualquier select visible con opciones numéricas
+    for sel in driver.find_elements(By.TAG_NAME, "select"):
+        try:
+            if not sel.is_displayed():
+                continue
+            opts = [o.get_attribute("value") for o in sel.find_elements(By.TAG_NAME, "option")]
+            if str(party_size) in opts and len(opts) <= 25:
+                Select(sel).select_by_value(str(party_size))
+                time.sleep(1.5)
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ── Fecha (jQuery UI datepicker) ──────────────────────────────────────────────
+
+_MONTHS_ES = {
+    "enero": 1, "febrero": 2, "marzo": 3, "abril": 4,
+    "mayo": 5, "junio": 6, "julio": 7, "agosto": 8,
+    "septiembre": 9, "octubre": 10, "noviembre": 11, "diciembre": 12,
+}
+
+def _set_date(driver, date_str: str) -> bool:
+    target = datetime.strptime(date_str, "%Y-%m-%d")
+
+    # Intentar con input[type='date'] (por si alguna versión lo usa)
+    for css in ["input[type='date']", "input[name='date']", "input[id*='date']"]:
+        try:
+            inp = driver.find_element(By.CSS_SELECTOR, css)
+            if inp.is_displayed():
+                driver.execute_script(
+                    "arguments[0].value=arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('change',{bubbles:true}));",
+                    inp, date_str,
+                )
+                time.sleep(2)
+                return True
+        except Exception:
+            pass
+
+    # jQuery UI datepicker (el que usa CoverManager)
+    for _ in range(14):  # máx 14 meses hacia adelante
+        try:
+            month_el = driver.find_element(By.CSS_SELECTOR, ".ui-datepicker-month")
+            year_el  = driver.find_element(By.CSS_SELECTOR, ".ui-datepicker-year")
+            cur_month = _MONTHS_ES.get(month_el.text.strip().lower(), 0)
+            cur_year  = int(year_el.text.strip())
+
+            if cur_month == target.month and cur_year == target.year:
+                # Buscar el día
+                cells = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    ".ui-datepicker-calendar td:not(.ui-datepicker-unselectable)"
+                    ":not(.ui-datepicker-other-month)"
+                )
+                for cell in cells:
+                    try:
+                        # Puede ser <a> o texto directo
+                        try:
+                            link = cell.find_element(By.TAG_NAME, "a")
+                            text = link.text.strip()
+                            clickable = link
+                        except Exception:
+                            text = cell.text.strip()
+                            clickable = cell
+
+                        if text == str(target.day):
+                            driver.execute_script("arguments[0].click();", clickable)
+                            time.sleep(2.5)
+                            return True
+                    except Exception:
+                        pass
+                break  # Mes correcto pero no encontramos el día
+
+            # Avanzar al siguiente mes
+            next_btn = driver.find_element(By.CSS_SELECTOR, ".ui-datepicker-next")
+            driver.execute_script("arguments[0].click();", next_btn)
+            time.sleep(0.5)
+
+        except Exception:
+            break
+
+    return False
+
+
+# ── Zona ──────────────────────────────────────────────────────────────────────
+
+def _set_zone(driver, preferred_zone: str):
+    if not preferred_zone:
+        return
+    zone_lower = preferred_zone.lower()
+
+    # Selector real de zona en CoverManager
+    for elem_id in ["extra-box-select"]:
+        try:
+            elem = driver.find_element(By.ID, elem_id)
+            for opt in elem.find_elements(By.TAG_NAME, "option"):
+                if zone_lower in opt.text.lower():
+                    Select(elem).select_by_visible_text(opt.text)
+                    time.sleep(0.5)
+                    return
+        except Exception:
+            pass
+
+    # Fallback genérico
+    for sel in driver.find_elements(By.TAG_NAME, "select"):
+        try:
+            for opt in sel.find_elements(By.TAG_NAME, "option"):
+                if zone_lower in opt.text.lower():
+                    Select(sel).select_by_visible_text(opt.text)
+                    time.sleep(0.5)
+                    return
+        except Exception:
+            pass
+
+
+# ── Extraer huecos ────────────────────────────────────────────────────────────
+
+def _extract_slots(driver, time_from: str, time_to: str) -> list[dict]:
+    """Lee los huecos disponibles del select#hour-box-select."""
+    slots = []
+    seen = set()
+
+    # PRIMARY: select#hour-box-select  (selector real de CoverManager)
+    for elem_id in ["hour-box-select", "extra_hour", "extra_hour_group_request"]:
+        try:
+            elem = driver.find_element(By.ID, elem_id)
+            options = elem.find_elements(By.TAG_NAME, "option")
+            for opt in options:
+                val = (opt.get_attribute("value") or "").strip()
+                if not val or val in ("-1", "0", "") or ":" not in val:
+                    continue
+                try:
+                    h, m = val.split(":")[:2]
+                    t = f"{int(h):02d}:{m[:2]}"
+                    if time_from <= t <= time_to and t not in seen:
+                        seen.add(t)
+                        slots.append({"time": t})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if slots:
+        return sorted(slots, key=lambda x: x["time"])
+
+    # FALLBACK: buscar elementos con tiempo en texto (botones, divs, links)
+    time_re = re.compile(r"\b(\d{1,2}:\d{2})\b")
+    skip_classes = {"disabled", "full", "closed", "unavailable", "past"}
+
+    for css in [
+        "[class*='slot']:not([class*='disabled'])",
+        "[class*='hour']:not([class*='disabled'])",
+        "button:not([disabled])", "a[data-time]", "[data-time]",
+    ]:
+        try:
+            for elem in driver.find_elements(By.CSS_SELECTOR, css)[:80]:
+                try:
+                    cls = (elem.get_attribute("class") or "").lower()
+                    if any(s in cls for s in skip_classes):
+                        continue
+                    for src in [elem.text, elem.get_attribute("data-time") or ""]:
+                        m = time_re.search(src)
+                        if m:
+                            h, mn = m.group(1).split(":")
+                            t = f"{int(h):02d}:{mn}"
+                            if time_from <= t <= time_to and t not in seen:
+                                seen.add(t)
+                                slots.append({"time": t})
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    return sorted(slots, key=lambda x: x["time"])
+
+
+# ── API pública ───────────────────────────────────────────────────────────────
+
+def test_url(url: str) -> dict:
+    """
+    Verifica que una URL de CoverManager funciona y devuelve los huecos de hoy.
+    Útil para probar desde la interfaz.
+    """
+    result = {"ok": False, "message": "", "details": {}, "screenshot": None}
+    driver = None
+    try:
+        driver = _get_driver()
+        driver.get(url)
+        time.sleep(5)
+
+        # Screenshot para debug
+        try:
+            result["screenshot"] = driver.get_screenshot_as_png()
+        except Exception:
+            pass
+
+        title = driver.title or ""
+        page_text = driver.page_source.lower()
+
+        is_cm = any(kw in page_text for kw in [
+            "covermanager", "module_restaurant", "people-box-select",
+            "hour-box-select", "reservar", "personas", "comensales",
+        ])
+
+        # Leer selects relevantes
+        slots_found = []
+        try:
+            elem = driver.find_element(By.ID, "hour-box-select")
+            for opt in elem.find_elements(By.TAG_NAME, "option"):
+                val = (opt.get_attribute("value") or "").strip()
+                if val and val != "-1" and ":" in val:
+                    slots_found.append(val)
+        except Exception:
+            pass
+
+        result["details"] = {
+            "title": title[:80],
+            "is_covermanager": is_cm,
+            "slots_today": slots_found[:12],
+        }
+
+        if is_cm:
+            result["ok"] = True
+            if slots_found:
+                result["message"] = f"✅ Página OK · {len(slots_found)} huecos hoy: {', '.join(slots_found[:6])}"
+            else:
+                result["message"] = "✅ Página OK · Sin huecos hoy (el bot monitorizará los próximos días)"
+        else:
+            result["message"] = "La página cargó pero no parece un widget de CoverManager."
+
+    except Exception as e:
+        result["message"] = f"Error: {str(e)[:120]}"
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+    return result
 
 
 def check_availability(
@@ -17,151 +328,49 @@ def check_availability(
     party_size: int,
     time_from: str = "00:00",
     time_to: str = "23:59",
+    preferred_zone: str = "",
 ) -> list[dict]:
     """
-    Comprueba disponibilidad en una página de CoverManager.
-
-    Args:
-        restaurant_url: URL del widget de reservas
-        date: Fecha en formato YYYY-MM-DD
-        party_size: Número de personas
-        time_from: Hora mínima deseada (HH:MM)
-        time_to: Hora máxima deseada (HH:MM)
+    Comprueba disponibilidad en CoverManager para una fecha y nº de personas.
 
     Returns:
-        Lista de huecos: [{'time': 'HH:MM'}, ...]
+        [{"time": "HH:MM"}, ...]
     """
-    available_slots = []
-    captured_json = []
+    driver = None
+    slots = []
+    try:
+        driver = _get_driver()
+        driver.get(restaurant_url)
+        time.sleep(5)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
-        )
-        context = browser.new_context(
-            locale="es-ES",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/121.0.0.0 Safari/537.36"
-            ),
-        )
-        page = context.new_page()
+        # 1. Personas
+        _set_people(driver, party_size)
 
-        # Capturar todas las respuestas JSON
-        def on_response(response):
+        # 2. Zona (antes de la fecha para no perder estado)
+        if preferred_zone:
+            _set_zone(driver, preferred_zone)
+
+        # 3. Fecha en el calendario
+        date_ok = _set_date(driver, date)
+        if not date_ok:
+            print(f"  [CM] Advertencia: no se pudo seleccionar la fecha {date}")
+        else:
+            time.sleep(1)
+
+        # 4. Extraer huecos
+        slots = _extract_slots(driver, time_from, time_to)
+        print(f"  [CM] {date} → {len(slots)} hueco(s): {[s['time'] for s in slots]}")
+
+    except Exception as e:
+        print(f"  [CM] Error: {e}")
+    finally:
+        if driver:
             try:
-                if "json" in response.headers.get("content-type", "") and response.status == 200:
-                    data = response.json()
-                    captured_json.append({"url": response.url, "data": data})
+                driver.quit()
             except Exception:
                 pass
 
-        page.on("response", on_response)
-
-        try:
-            page.goto(restaurant_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
-
-            # Intentar seleccionar número de personas
-            for sel in [
-                'select[name="people"]',
-                "#people",
-                'select[id*="person"]',
-                'select[id*="guest"]',
-                'select[id*="pax"]',
-                'select[id*="persona"]',
-                'select[id*="comensal"]',
-            ]:
-                try:
-                    elem = page.locator(sel).first
-                    if elem.count() > 0 and elem.is_visible(timeout=1000):
-                        elem.select_option(str(party_size))
-                        page.wait_for_timeout(1000)
-                        break
-                except Exception:
-                    pass
-
-            # Intentar rellenar campo de fecha
-            for sel in [
-                'input[type="date"]',
-                'input[name="date"]',
-                'input[id*="date"]',
-                'input[id*="fecha"]',
-            ]:
-                try:
-                    elem = page.locator(sel).first
-                    if elem.count() > 0 and elem.is_visible(timeout=1000):
-                        elem.fill(date)
-                        page.keyboard.press("Enter")
-                        page.wait_for_timeout(2000)
-                        break
-                except Exception:
-                    pass
-
-            # Esperar a que carguen los huecos
-            page.wait_for_timeout(4000)
-
-            # Leer huecos disponibles del DOM
-            time_re = re.compile(r"\b(\d{1,2}:\d{2})\b")
-            seen = set()
-
-            slot_selectors = [
-                "button:not([disabled])",
-                "[class*='slot']:not([class*='disabled']):not([class*='full'])",
-                "[class*='time']:not([class*='disabled'])",
-                "[class*='hour']:not([class*='disabled'])",
-                "li[data-time]",
-                "[data-time]",
-                "a[href*='time']",
-            ]
-
-            for sel in slot_selectors:
-                try:
-                    elements = page.locator(sel).all()
-                    for elem in elements[:60]:
-                        try:
-                            text = elem.inner_text(timeout=500).strip()
-                            match = time_re.search(text)
-                            if match:
-                                t = match.group(1)
-                                if time_from <= t <= time_to and t not in seen:
-                                    seen.add(t)
-                                    available_slots.append({"time": t})
-                        except Exception:
-                            pass
-                    if available_slots:
-                        break
-                except Exception:
-                    pass
-
-        except Exception as e:
-            print(f"  Error Playwright: {e}")
-        finally:
-            browser.close()
-
-    # Fallback: extraer horas de las respuestas API capturadas
-    if not available_slots:
-        available_slots = _parse_api_responses(captured_json, time_from, time_to)
-
-    return sorted(available_slots, key=lambda x: x["time"])
-
-
-def _parse_api_responses(responses: list, time_from: str, time_to: str) -> list:
-    """Extrae horas disponibles de las respuestas JSON capturadas."""
-    time_re = re.compile(r"\b(\d{1,2}:\d{2})\b")
-    seen = set()
-    slots = []
-
-    for resp in responses:
-        raw = json.dumps(resp["data"])
-        for t in time_re.findall(raw):
-            if time_from <= t <= time_to and t not in seen:
-                seen.add(t)
-                slots.append({"time": t})
-
-    return sorted(slots, key=lambda x: x["time"])
+    return slots
 
 
 def auto_book(
@@ -174,108 +383,171 @@ def auto_book(
     guest_phone: str,
     guest_notes: str = "",
 ) -> bool:
-    """
-    Intenta hacer la reserva automáticamente en CoverManager.
-    Devuelve True si parece haber funcionado.
-    """
-    success = False
+    """Realiza la reserva automáticamente."""
+    driver = None
+    try:
+        driver = _get_driver()
+        driver.get(restaurant_url)
+        time.sleep(5)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
-        context = browser.new_context(locale="es-ES")
-        page = context.new_page()
+        # Personas
+        _set_people(driver, party_size)
 
+        # Fecha
+        _set_date(driver, date)
+
+        # Seleccionar la hora en hour-box-select
+        hour_selected = False
         try:
-            page.goto(restaurant_url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(2000)
+            elem = driver.find_element(By.ID, "hour-box-select")
+            Select(elem).select_by_value(slot_time)
+            hour_selected = True
+            time.sleep(1)
+        except Exception:
+            pass
 
-            # Seleccionar personas
-            for sel in ['select[name="people"]', "#people", 'select[id*="person"]']:
-                try:
-                    e = page.locator(sel).first
-                    if e.count() > 0 and e.is_visible(timeout=1000):
-                        e.select_option(str(party_size))
-                        break
-                except Exception:
-                    pass
-
-            # Rellenar fecha
-            for sel in ['input[type="date"]', 'input[name="date"]']:
-                try:
-                    e = page.locator(sel).first
-                    if e.count() > 0 and e.is_visible(timeout=1000):
-                        e.fill(date)
-                        page.keyboard.press("Enter")
-                        page.wait_for_timeout(2000)
-                        break
-                except Exception:
-                    pass
-
-            page.wait_for_timeout(3000)
-
-            # Hacer clic en el hueco de la hora objetivo
+        if not hour_selected:
+            # Fallback: buscar botón/elemento con esa hora
             time_re = re.compile(r"\b" + re.escape(slot_time) + r"\b")
-            clicked = False
-            for sel in ["button", "li[data-time]", "[data-time]", "[class*='slot']"]:
-                try:
-                    elements = page.locator(sel).all()
-                    for elem in elements[:60]:
-                        try:
-                            text = elem.inner_text(timeout=300).strip()
-                            if time_re.search(text):
-                                elem.click()
-                                clicked = True
-                                page.wait_for_timeout(2000)
-                                break
-                        except Exception:
-                            pass
-                    if clicked:
-                        break
-                except Exception:
-                    pass
-
-            if not clicked:
-                print("  No se encontró el hueco en el DOM")
-                return False
-
-            # Rellenar formulario de datos personales
-            field_map = {
-                'input[name="name"], input[id*="name"], input[placeholder*="nombre"]': guest_name,
-                'input[name="email"], input[type="email"]': guest_email,
-                'input[name="phone"], input[type="tel"], input[id*="phone"]': guest_phone,
-                'textarea[name="notes"], textarea[id*="notes"], textarea[id*="comment"]': guest_notes,
-            }
-
-            for selector_group, value in field_map.items():
-                for sel in selector_group.split(", "):
+            for css in ["button", "[class*='slot']", "[data-time]", "a", "li"]:
+                for elem in driver.find_elements(By.CSS_SELECTOR, css)[:60]:
                     try:
-                        e = page.locator(sel).first
-                        if e.count() > 0 and e.is_visible(timeout=1000):
-                            e.fill(value)
+                        if time_re.search(elem.text) and elem.is_displayed():
+                            driver.execute_script("arguments[0].click();", elem)
+                            hour_selected = True
+                            time.sleep(1.5)
                             break
                     except Exception:
                         pass
+                if hour_selected:
+                    break
 
-            # Hacer clic en el botón de confirmar
-            for sel in [
-                'button[type="submit"]',
-                "button:has-text('Confirmar')",
-                "button:has-text('Reservar')",
-                "button:has-text('Finalizar')",
-            ]:
+        if not hour_selected:
+            print(f"  [CM] No se pudo seleccionar el hueco {slot_time}")
+            return False
+
+        # Clic en "Reservar" (paso 1)
+        clicked_reserve = False
+        for css in [
+            "input.reservarButton.step1",
+            "input[class*='reservarButton'][value*='eservar']",
+            "input[class*='reservarButton']",
+            "button[class*='reservarButton']",
+        ]:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, css)
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    clicked_reserve = True
+                    time.sleep(2)
+                    break
+            except Exception:
+                pass
+
+        if not clicked_reserve:
+            # Buscar botón por texto
+            for btn in driver.find_elements(By.TAG_NAME, "input"):
                 try:
-                    e = page.locator(sel).first
-                    if e.count() > 0 and e.is_visible(timeout=1000):
-                        e.click()
-                        page.wait_for_timeout(3000)
-                        success = True
+                    val = (btn.get_attribute("value") or "").lower()
+                    if "reservar" in val and btn.is_displayed():
+                        driver.execute_script("arguments[0].click();", btn)
+                        clicked_reserve = True
+                        time.sleep(2)
                         break
                 except Exception:
                     pass
 
-        except Exception as e:
-            print(f"  Error en reserva automática: {e}")
-        finally:
-            browser.close()
+        if not clicked_reserve:
+            print("  [CM] No se encontró el botón Reservar")
+            return False
 
-    return success
+        # Rellenar datos personales
+        # Dividir nombre en nombre + apellido
+        parts = guest_name.strip().split(" ", 1)
+        first_name = parts[0]
+        last_name  = parts[1] if len(parts) > 1 else ""
+
+        _fill_by_id(driver, "user_first_name", first_name)
+        _fill_by_id(driver, "user_last_name",  last_name)
+        _fill_by_id(driver, "user_email",      guest_email)
+        _fill_by_id(driver, "prescriber_phone", guest_phone)
+
+        # Notas/comentarios (si existe el campo)
+        if guest_notes:
+            for field_id in ["comments", "note", "observations", "notas", "comment"]:
+                _fill_by_id(driver, field_id, guest_notes, required=False)
+
+        time.sleep(0.5)
+
+        # Confirmar (paso 2)
+        confirmed = False
+        for css in [
+            "button.reservarButton.step2",
+            "button[class*='reservarButton']",
+            "input[class*='reservarButton'][class*='step2']",
+        ]:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, css)
+                if btn.is_displayed():
+                    driver.execute_script("arguments[0].click();", btn)
+                    confirmed = True
+                    time.sleep(3)
+                    break
+            except Exception:
+                pass
+
+        if not confirmed:
+            # Buscar por texto en todos los botones
+            for btn in driver.find_elements(By.CSS_SELECTOR, "button, input[type='button'], input[type='submit']"):
+                try:
+                    text = (btn.text + " " + (btn.get_attribute("value") or "")).lower()
+                    if any(kw in text for kw in ["confirm", "reservar", "finalizar", "enviar", "aceptar"]):
+                        if btn.is_displayed():
+                            driver.execute_script("arguments[0].click();", btn)
+                            confirmed = True
+                            time.sleep(3)
+                            break
+                except Exception:
+                    pass
+
+        # Verificar confirmación en el texto de la página
+        page_lower = driver.page_source.lower()
+        success = confirmed and any(kw in page_lower for kw in [
+            "confirmad", "confirmed", "gracias", "thank", "reserva realizada",
+            "booking confirmed", "éxito",
+        ])
+        return success
+
+    except Exception as e:
+        print(f"  [CM] Error auto_book: {e}")
+        return False
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+def _fill_by_id(driver, field_id: str, value: str, required: bool = True):
+    """Rellena un input por su ID."""
+    try:
+        inp = driver.find_element(By.ID, field_id)
+        if inp.is_displayed():
+            inp.clear()
+            inp.send_keys(value)
+            return True
+    except Exception:
+        pass
+    if not required:
+        return False
+    # Fallback por name
+    try:
+        inp = driver.find_element(By.NAME, field_id)
+        if inp.is_displayed():
+            inp.clear()
+            inp.send_keys(value)
+            return True
+    except Exception:
+        pass
+    return False
