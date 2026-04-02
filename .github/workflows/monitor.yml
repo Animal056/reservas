@@ -1,0 +1,53 @@
+name: Monitor Restaurantes
+
+on:
+  schedule:
+    # Cada 5 minutos (mínimo de GitHub Actions)
+    - cron: "*/5 * * * *"
+  # También se puede lanzar manualmente desde GitHub
+  workflow_dispatch:
+
+# Evita ejecuciones paralelas (un solo monitor a la vez)
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium --with-deps
+
+      - name: Ejecutar monitor
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python monitor.py
+
+      - name: Guardar estado en el repo
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore: update state [skip ci]"
+            git push
+          fi
